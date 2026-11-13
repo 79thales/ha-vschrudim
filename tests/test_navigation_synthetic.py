@@ -13,11 +13,16 @@ PACKAGE.__path__ = [str(ROOT)]
 sys.modules["vschrudim_test"] = PACKAGE
 
 from bs4 import BeautifulSoup  # noqa: E402
-from vschrudim_test.profile_navigation import form_payload, navigation_candidate  # noqa: E402
+from vschrudim_test.profile_navigation import (  # noqa: E402
+    form_payload,
+    navigation_candidate,
+    profile_diagnostics,
+)
 from vschrudim_test.vschrudim_client import (  # noqa: E402
     VSChrudimAuthError,
     VSChrudimClient,
     VSChrudimError,
+    VSChrudimNoReadingsError,
 )
 
 BASE = "https://synthetic.invalid"
@@ -184,9 +189,6 @@ class NavigationTests(unittest.TestCase):
             client.open_profile_data()
         self.assertEqual(client.s.calls, [])
 
-
-
-
     def test_original_csv_download_and_parser_still_work(self):
         """Navazující původní CSV klient zůstává volatelný a beze změny."""
         content = "MERIDLO;CAS;STAV\nX;01.01.2026 00:00:00;1,25\n"
@@ -253,7 +255,7 @@ class NavigationTests(unittest.TestCase):
         redirect = Response("", PROFILE, 302, headers={"Location": "/Default.aspx"})
         login = Response("<form><input type='password'></form>", BASE + "/Default.aspx")
         client = client_with_main(
-            '<form>'
+            "<form>"
             + CONTEXT
             + '<a href="./ProfileData.aspx">Naměřené stavy</a></form>',
             gets=[redirect, login],
@@ -333,6 +335,313 @@ class NavigationTests(unittest.TestCase):
             client.open_profile_data()
         self.assertEqual(client.s.calls, [])
 
+
+class EmptyProfileTests(unittest.TestCase):
+    """Izolace místa bez měřidla při skutečném průchodu navigačním klientem."""
+
+    @staticmethod
+    def client_for_profiles(profiles):
+        """Smyšlená místa mají vlastní kontext; HTTP i CSV zůstávají bez sítě.
+
+        Každé otevření profilu spotřebuje právě jednu připravenou odpověď.
+        Seznam downloaded zachycuje pořadí míst, u nichž se opravdu četlo CSV;
+        neobsahuje účty, cookies ani skutečné identifikátory.
+        """
+        places = [
+            {
+                **PLACE,
+                "index": index,
+                "adresa": f"Smyšlené místo {index + 1}",
+                "evidencni_cislo": f"A-{index}",
+                "technicke_cislo": f"T-{index}",
+            }
+            for index in range(len(profiles))
+        ]
+        responses = []
+        for index, response in enumerate(profiles):
+            place = places[index]
+            html = response.text.replace("A-123", place["evidencni_cislo"])
+            html = html.replace("T-456", place["technicke_cislo"])
+            responses.append(Response(html, response.url, response.status_code))
+        client = VSChrudimClient("synthetic", "synthetic", BASE)
+        client.s = Session(gets=responses)
+        client.login = lambda: None
+        client.list_consumption_places = lambda: places
+        selected, downloaded = [0], []
+
+        def select(index):
+            selected[0] = index
+            client._selected_place = places[index]
+            html = CONTEXT.replace("A-123", places[index]["evidencni_cislo"])
+            html = html.replace("T-456", places[index]["technicke_cislo"])
+            client._selected_response = Response(html, MAIN)
+            client._context_verified = True
+
+        def download(href, profile_url):
+            downloaded.append(selected[0])
+            return "MERIDLO;CAS;STAV\nX;01.01.2026 00:00:00;1,25\n"
+
+        client.select_consumption_place = select
+        client._download_csv_text = download
+        return client, downloaded
+
+    @staticmethod
+    def empty_profile():
+        """Prázdný select značí absenci voleb, nikoli nulový stav vodoměru."""
+        points = '<select name="ctl$edMeteringPoint"></select>'
+        return PROFILE_HTML.replace(EXPORT, points)
+
+    def test_valid_first_place_survives_empty_second_profile(self):
+        """Druhé místo bez měřidla nesmí zahodit už načtené první místo."""
+        client, downloaded = self.client_for_profiles(
+            [Response(PROFILE_HTML, PROFILE), Response(self.empty_profile(), PROFILE)]
+        )
+        result = client.get_latest_readings("M")
+        self.assertEqual(list(result), ["T-0"])
+        self.assertEqual(result["T-0"]["value"], 1.25)
+        self.assertEqual(downloaded, [0])
+
+    def test_empty_first_profile_does_not_block_valid_second_place(self):
+        """Průchod musí pokračovat i při opačném pořadí dostupných odečtů."""
+        client, downloaded = self.client_for_profiles(
+            [Response(self.empty_profile(), PROFILE), Response(PROFILE_HTML, PROFILE)]
+        )
+        result = client.get_latest_readings("M")
+        self.assertEqual(list(result), ["T-1"])
+        self.assertEqual(result["T-1"]["value"], 1.25)
+        self.assertEqual(downloaded, [1])
+
+    def test_all_profiles_without_meters_still_fail(self):
+        """Účet bez odečtů nesmí potvrdit úspěšné naplnění prázdné historie."""
+        client, downloaded = self.client_for_profiles(
+            [Response(self.empty_profile(), PROFILE)] * 2
+        )
+        with self.assertRaisesRegex(
+            VSChrudimError, "Portál nevrátil použitelné odečty žádného místa"
+        ):
+            client.get_latest_readings("M")
+        self.assertEqual(downloaded, [])
+
+    def test_year_history_requests_only_valid_place_profile(self):
+        """První roční backfill přepíná filtr jen místu s dostupným měřidlem."""
+        for valid_index in (0, 1):
+            with self.subTest(valid_index=valid_index):
+                profiles = [Response(self.empty_profile(), PROFILE)] * 2
+                profiles[valid_index] = Response(PROFILE_HTML, PROFILE)
+                client, downloaded = self.client_for_profiles(profiles)
+                year_html = PROFILE_HTML.replace("A-123", f"A-{valid_index}")
+                year_html = year_html.replace("T-456", f"T-{valid_index}")
+                client.s.posts = [Response(year_html, PROFILE)]
+                result = client.get_latest_readings("Y")
+                self.assertEqual(list(result), [f"T-{valid_index}"])
+                self.assertEqual(downloaded, [valid_index])
+                self.assertEqual([call[0] for call in client.s.calls].count("POST"), 1)
+
+    def test_empty_profile_without_ids_uses_fresh_verified_selection(self):
+        """Skutečný portál může na profilu vynechat ID ověřené na MainInfo."""
+        for valid_index in (0, 1):
+            with self.subTest(valid_index=valid_index):
+                no_ids = self.empty_profile().replace(CONTEXT, "")
+                profiles = [Response(no_ids, PROFILE)] * 2
+                profiles[valid_index] = Response(PROFILE_HTML, PROFILE)
+                client, downloaded = self.client_for_profiles(profiles)
+                result = client.get_latest_readings("M")
+                self.assertEqual(list(result), [f"T-{valid_index}"])
+                self.assertEqual(downloaded, [valid_index])
+
+    def test_empty_profile_without_any_verified_context_is_rejected(self):
+        """Prázdné kontrolky samy nesmějí potvrdit neověřenou identitu."""
+        no_ids = self.empty_profile().replace(CONTEXT, "")
+        client = client_with_main(no_ids, url=PROFILE, verified=False)
+        with self.assertRaises(VSChrudimError) as error:
+            client.open_profile_data()
+        self.assertNotIsInstance(error.exception, VSChrudimNoReadingsError)
+        self.assertEqual(client.s.calls, [])
+
+    def test_new_selection_clears_previous_verified_context_before_failure(self):
+        """Kontext předchozího místa nelze převzít po selhání další volby."""
+        client = client_with_main(PROFILE_HTML, url=PROFILE, verified=True)
+        with self.assertRaises(VSChrudimError):
+            client.select_consumption_place(1)
+        self.assertFalse(client._context_verified)
+        self.assertIsNone(client._selected_place)
+        self.assertIsNone(client._selected_response)
+
+    def test_empty_profile_does_not_hide_unknown_or_mismatched_pages(self):
+        """Pouhá absence odkazu nestačí; chybný kontext či struktura dál selže."""
+        empty = self.empty_profile()
+        cases = {
+            "cizí identita": Response(empty.replace("A-123", "OTHER"), PROFILE),
+            "chybějící filtr": Response(empty.replace(FILTER, ""), PROFILE),
+            "chybějící select měřidla": Response(
+                empty.replace('<select name="ctl$edMeteringPoint"></select>', ""),
+                PROFILE,
+            ),
+            "existující volba měřidla": Response(
+                empty.replace(
+                    '<select name="ctl$edMeteringPoint"></select>',
+                    '<select name="ctl$edMeteringPoint"><option value="X">'
+                    "Měřidlo</option></select>",
+                ),
+                PROFILE,
+            ),
+            "pouze prázdná volba": Response(
+                empty.replace(
+                    '<select name="ctl$edMeteringPoint"></select>',
+                    '<select name="ctl$edMeteringPoint"><option value="">'
+                    "Vyberte</option></select>",
+                ),
+                PROFILE,
+            ),
+            "duplicitní výběr měřidla": Response(
+                empty.replace(
+                    "</form>",
+                    '<select name="other$edMeteringPoint"></select></form>',
+                ),
+                PROFILE,
+            ),
+            "profil bez formuláře": Response(
+                empty.replace('<form action="./ProfileData.aspx">', "").replace(
+                    "</form>", ""
+                ),
+                PROFILE,
+            ),
+            "filtr bez měsíční volby": Response(
+                empty.replace('<option value="M" selected>M</option>', ""),
+                PROFILE,
+            ),
+            "jiná stránka": Response(empty, MAIN),
+            "neznámé HTML": Response("<html>Chyba aplikace</html>", PROFILE),
+            "filtr v jiném formuláři": Response(
+                empty.replace(FILTER, "") + "<form>" + FILTER + "</form>", PROFILE
+            ),
+            "cizí cíl formuláře": Response(
+                empty.replace("./ProfileData.aspx", "https://elsewhere.invalid/"),
+                PROFILE,
+            ),
+            "odlišný cíl formuláře": Response(
+                empty.replace("./ProfileData.aspx", "./MainInfo.aspx"), PROFILE
+            ),
+            "jiný server": Response(
+                empty, "https://elsewhere.invalid/UserData/ProfileData.aspx"
+            ),
+        }
+        for name, response in cases.items():
+            with self.subTest(case=name):
+                client, downloaded = self.client_for_profiles(
+                    [Response(PROFILE_HTML, PROFILE), response]
+                )
+                with self.assertRaises(VSChrudimError) as error:
+                    client.get_latest_readings("M")
+                self.assertNotIsInstance(error.exception, VSChrudimNoReadingsError)
+                self.assertEqual(downloaded, [0])
+
+    def test_empty_profile_does_not_hide_expired_session(self):
+        """Přihlašovací stránka má přednost před známkami prázdného profilu."""
+        client, downloaded = self.client_for_profiles(
+            [
+                Response(PROFILE_HTML, PROFILE),
+                Response(self.empty_profile() + '<input type="password">', PROFILE),
+            ]
+        )
+        with self.assertRaises(VSChrudimAuthError):
+            client.get_latest_readings("M")
+        self.assertEqual(downloaded, [0])
+
+    def test_empty_profile_does_not_hide_failed_http(self):
+        """Ani profil se správnou strukturou nesmí zamaskovat HTTP selhání."""
+        for status in (401, 403, 500, 503):
+            with self.subTest(status=status):
+                client, downloaded = self.client_for_profiles(
+                    [
+                        Response(PROFILE_HTML, PROFILE),
+                        Response(self.empty_profile(), PROFILE, status=status),
+                    ]
+                )
+                with self.assertRaises(requests.HTTPError):
+                    client.get_latest_readings("M")
+                self.assertEqual(downloaded, [0])
+
+    def test_timeout_after_valid_place_is_not_reported_as_success(self):
+        """Síťová chyba dalšího místa se nesmí změnit v částečný úspěch."""
+        client, downloaded = self.client_for_profiles(
+            [Response(PROFILE_HTML, PROFILE), Response(self.empty_profile(), PROFILE)]
+        )
+        original_get = client.s.get
+
+        def get(url, **kwargs):
+            if len(client.s.gets) == 1:
+                raise requests.Timeout("Syntetický timeout bez skutečné URL")
+            return original_get(url, **kwargs)
+
+        client.s.get = get
+        with self.assertRaises(requests.Timeout):
+            client.get_latest_readings("M")
+        self.assertEqual(downloaded, [0])
+
+    def test_direct_empty_profile_needs_no_second_request(self):
+        """Již otevřený prázdný profil se ověří bez opakovaného GET."""
+        client = client_with_main(self.empty_profile(), url=PROFILE)
+        with self.assertRaises(VSChrudimNoReadingsError):
+            client.open_profile_data()
+        self.assertEqual(client.s.calls, [])
+
+    def test_empty_profile_after_postback_is_recognized(self):
+        """Stejné rozlišení platí i po původním WebForms postbacku."""
+        main = (
+            '<form action="./MainInfo.aspx">'
+            + CONTEXT
+            + '<button name="menu$profile" type="submit">Naměřené stavy</button>'
+            + "</form>"
+        )
+        client = client_with_main(main, posts=[Response(self.empty_profile(), PROFILE)])
+        with self.assertRaises(VSChrudimNoReadingsError):
+            client.open_profile_data()
+        self.assertEqual([call[0] for call in client.s.calls], ["POST"])
+
+    def test_existing_export_is_preserved_even_with_empty_selector(self):
+        """Existující export zachová původní cestu stahování a CSV parser."""
+        client, downloaded = self.client_for_profiles(
+            [
+                Response(PROFILE_HTML, PROFILE),
+                Response(
+                    self.empty_profile().replace("</form>", EXPORT + "</form>"), PROFILE
+                ),
+            ]
+        )
+        result = client.get_latest_readings("M")
+        self.assertEqual(list(result), ["T-0", "T-1"])
+        self.assertEqual(downloaded, [0, 1])
+
+    def test_profile_diagnostics_do_not_return_private_values(self):
+        """Libovolný obsah a query se nesmějí promítnout do logovacího slovníku."""
+        html = self.empty_profile() + '<input value="private@example.invalid">'
+        result = profile_diagnostics(html, PROFILE + "?secret=not-for-logs")
+        self.assertEqual(result["meter_options"], [0])
+        self.assertTrue(result["month_option"])
+        self.assertTrue(result["same_form"])
+        serialized = str(result)
+        for private in (
+            "private@example.invalid",
+            "not-for-logs",
+            "A-123",
+            "T-456",
+            "synthetic.invalid",
+            "<input",
+        ):
+            self.assertNotIn(private, serialized)
+
+    def test_skipped_profile_log_contains_only_ordinal(self):
+        """Nový log nesmí obsahovat identifikátory míst ani obsah odpovědi."""
+        client, _ = self.client_for_profiles(
+            [Response(PROFILE_HTML, PROFILE), Response(self.empty_profile(), PROFILE)]
+        )
+        with self.assertLogs("vschrudim_test.vschrudim_client", level="DEBUG") as logs:
+            client.get_latest_readings("M")
+        logged = "\n".join(logs.output)
+        self.assertIn("pořadí 2 z 2", logged)
+        for forbidden in ("A-1", "T-1", "Smyšlené místo", "synthetic", "<select"):
+            self.assertNotIn(forbidden, logged)
 
 
 if __name__ == "__main__":

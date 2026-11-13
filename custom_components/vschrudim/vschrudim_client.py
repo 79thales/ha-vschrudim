@@ -27,7 +27,9 @@ from .profile_navigation import (
     form_payload,
     login_page,
     navigation_candidate,
+    profile_diagnostics,
     profile_ready,
+    profile_without_meter,
     safe_url,
 )
 
@@ -42,6 +44,14 @@ class VSChrudimError(Exception):
 
 class VSChrudimAuthError(VSChrudimError):
     """Přihlašovací údaje byly serverem odmítnuty."""
+
+
+class VSChrudimNoReadingsError(VSChrudimError):
+    """Ověřený profil výslovně nenabízí žádné dálkové měřidlo.
+
+    Pouze tento stav lze při zpracování více míst přeskočit. Nenahrazuje
+    selhání přihlášení, HTTP, identity ani neznámou odpověď portálu.
+    """
 
 
 class VSChrudimClient:
@@ -408,13 +418,34 @@ class VSChrudimClient:
             if not self._context_verified:
                 raise VSChrudimError("Portál nepotvrdil identitu vybraného místa.")
             if not profile_ready(response.text, require_filter=require_filter):
+                # Profil portálu může ID vynechat. Ověření výše proto stejně
+                # jako u profilu s exportem uznává čerstvý kontext MainInfo.
+                # select_consumption_place jej před každou novou volbou maže;
+                # konkrétní rozpor identity aktuální odpovědi je vždy chybou.
+                if profile_without_meter(response.text, response.url):
+                    raise VSChrudimNoReadingsError(
+                        "Ověřené místo nenabízí měřidlo s dálkovými odečty."
+                    )
+                # Jen anonymní strukturální signály pro diagnostiku běžného
+                # běhu integrace; žádné přímé čtení hesel ani výpis odpovědi.
+                _LOGGER.warning(
+                    "Struktura odmítnutého profilu: pořadí=%s, kontext=%s, "
+                    "identita_odpovědi=%s, struktura=%s",
+                    self._selected_place["index"] + 1,
+                    self._context_verified,
+                    status,
+                    profile_diagnostics(response.text, response.url),
+                )
                 raise VSChrudimError(
                     "Stránka odečtů nemá ověřitelný export nebo filtr."
                 )
             return response.text, response.url
 
-        # Server může po volbě místa už vrátit finální stránku.
-        if profile_ready(r0.text, require_filter=True):
+        # Server může vrátit přímo profil s exportem i známý prázdný profil.
+        # finish() v obou případech nejdříve ověří HTTP, relaci a identitu.
+        if profile_ready(r0.text, require_filter=True) or profile_without_meter(
+            r0.text, r0.url
+        ):
             return finish(r0, require_filter=True)
 
         candidate = navigation_candidate(r0.text)
@@ -686,10 +717,21 @@ class VSChrudimClient:
 
         result: dict[str, dict] = {}
 
-        for place in active:
+        for ordinal, place in enumerate(active, start=1):
             self.select_consumption_place(place["index"])
 
-            profile_html, profile_url = self.open_profile_data()
+            try:
+                profile_html, profile_url = self.open_profile_data()
+            except VSChrudimNoReadingsError:
+                # Absence měřidla jednoho ověřeného místa nesmí zahodit CSV
+                # ostatních míst. HTTP/auth/identita i neznámé HTML dál selžou.
+                # Log obsahuje jen pořadí, nikoli identifikátory nebo obsah.
+                _LOGGER.debug(
+                    "Místo na pořadí %s z %s nemá dálkové měřidlo; přeskakuji.",
+                    ordinal,
+                    len(active),
+                )
+                continue
 
             # "M" (poslední měsíc) je serverový výchozí stav rovnou
             # po otevření ProfileData.aspx (ověřeno) - přepínat

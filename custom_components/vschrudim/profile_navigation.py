@@ -93,6 +93,77 @@ def profile_ready(html: str, *, require_filter: bool) -> bool:
     )
 
 
+def profile_diagnostics(html: str, url: str) -> dict:
+    """Vrátit jen počty a příznaky známých kontrolek; nikdy hodnoty ani HTML.
+
+    Výstup je vhodný pro log odmítnuté odpovědi. Neobsahuje URL, query,
+    identifikátory, názvy polí s dynamickým obsahem ani přihlašovací údaje.
+    O povolení odečtů nerozhoduje, slouží pouze k rozlišení struktury stránky.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    points = soup.find_all(
+        "select", attrs={"name": re.compile(r"edMeteringPoint$", re.I)}
+    )
+    periods = soup.find_all(
+        "select", attrs={"name": re.compile(r"edGraphLength$", re.I)}
+    )
+    form = points[0].find_parent("form") if points else None
+    action_ok = False
+    if form:
+        try:
+            action = safe_url(url, url, str(form.get("action") or url))
+            action_ok = urlsplit(action).path.casefold() == "/userdata/profiledata.aspx"
+        except ValueError:
+            pass
+    return {
+        "profile_path": urlsplit(url).path.casefold() == "/userdata/profiledata.aspx",
+        "meter_selects": len(points),
+        "meter_selects_by_id": len(
+            soup.find_all("select", id=re.compile(r"edMeteringPoint$", re.I))
+        ),
+        "meter_options": [len(point.find_all("option")) for point in points],
+        "period_filters": len(periods),
+        "month_option": any(
+            period.find("option", attrs={"value": "M"}) for period in periods
+        ),
+        "same_form": bool(form and periods and periods[0].find_parent("form") is form),
+        "action_profile": action_ok,
+    }
+
+
+def profile_without_meter(html: str, url: str) -> bool:
+    """Rozpoznat pouze známý profil bez nabízeného dálkového měřidla.
+
+    Jde o strukturální kontrolu HTML bez sítě: očekává stránku ProfileData,
+    jediný prázdný select edMeteringPoint a filtr s volbou měsíce ve stejném
+    formuláři. Přítomný export, jiná stránka či neznámá struktura vrací False.
+    Žádné odečty ani nulovou spotřebu nevytváří. Úspěšné HTTP, relaci a identitu
+    právě zvoleného místa musí před použitím výsledku ověřit volající.
+    """
+    if urlsplit(url).path.casefold() != "/userdata/profiledata.aspx":
+        return False
+    soup = BeautifulSoup(html, "html.parser")
+    if soup.find("a", href=re.compile(r"DocumentShow\.aspx(?:\?|$)", re.I)):
+        return False
+    points = soup.find_all(
+        "select", attrs={"name": re.compile(r"edMeteringPoint$", re.I)}
+    )
+    if len(points) != 1 or points[0].find("option") is not None:
+        return False
+    form = points[0].find_parent("form")
+    if form is None:
+        return False
+    period = form.find("select", attrs={"name": re.compile(r"edGraphLength$", re.I)})
+    if period is None or period.find("option", attrs={"value": "M"}) is None:
+        return False
+    # Cizí či odlišný cíl formuláře není známý prázdný profil.
+    try:
+        action = safe_url(url, url, str(form.get("action") or url))
+    except ValueError:
+        return False
+    return urlsplit(action).path.casefold() == "/userdata/profiledata.aspx"
+
+
 def navigation_candidate(html: str):
     """Vrátit jen rozpoznaný profilový odkaz, postback nebo submit ovládání."""
     soup = BeautifulSoup(html, "html.parser")
